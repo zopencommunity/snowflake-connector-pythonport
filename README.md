@@ -92,6 +92,23 @@ level:
 Cannot use arrow result format, fallback to json format
 ```
 
+You will also see one warning on the first import, which is expected and not an
+error:
+
+```
+Failed to import ArrowResult. No Apache Arrow result set format can be used.
+ImportError: No module named 'snowflake.connector.nanoarrow_arrow_iterator'
+```
+
+It comes from a `logger.warning` in `cursor.py`, and since the connector
+installs a `NullHandler` and most programs configure no handler at all, Python's
+last-resort handler prints it to stderr. Silence it if it is noise:
+
+```python
+import logging
+logging.getLogger("snowflake.connector.cursor").setLevel(logging.ERROR)
+```
+
 Everything returns the same values it would anywhere else. Large result sets
 parse more slowly than they would with the Arrow decoder.
 

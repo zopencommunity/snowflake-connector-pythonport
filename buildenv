@@ -620,6 +620,17 @@ is automatic and the connector logs it at debug level:
 
     Cannot use arrow result format, fallback to json format
 
+You will see one warning on the first import, which is expected and not an
+error:
+
+    Failed to import ArrowResult. No Apache Arrow result set format can be
+    used. ImportError: No module named 'snowflake.connector.nanoarrow_arrow_iterator'
+
+To silence it:
+
+    import logging
+    logging.getLogger("snowflake.connector.cursor").setLevel(logging.ERROR)
+
 The reason is byte order. Arrow's IPC format is little-endian by definition and
 this is a big-endian machine, so every buffer needs swapping on the way in. That
 path exists in nanoarrow but has never been exercised here, and a decoder that
