@@ -137,6 +137,42 @@ Windows binaries — so pip on z/OS falls through to the sdist. The sdist's
 decoder. This port is what stops that happening by accident, and it publishes a
 `py3-none-any` wheel so every interpreter shares one artifact.
 
+## The minicore libraries
+
+The connector vendors a small native library called *minicore*, shipped as one
+directory per platform: `aix_ppc64`, `linux_{x86_64,aarch64}_{glibc,musl}`,
+`macos_{x86_64,aarch64}` and `windows_x86_64`. None of them is z/OS.
+
+`setup.py` normally strips the ones it does not need, but it gives up when it
+cannot identify the platform it is on:
+
+```python
+keep = _minicore_native_subdir()
+if keep is None:
+    return
+```
+
+and `_minicore_native_subdir()` returns `None` for any machine that is not
+x86_64, aarch64 or ppc64. On z/OS the "keep only the native one" path therefore
+becomes "keep all nine", and the wheel comes out at **14 MB instead of 1.2 MB**
+— most of it an AIX static archive that is 17 MB uncompressed.
+
+This port removes those directories before building. Nothing needs them:
+`snowflake/connector/__init__.py` already treats the library as optional.
+
+```python
+try:
+    _core_loader.load()
+except Exception:
+    # This ensures the connector module loads even if the minicore library
+    # is unavailable
+    pass
+```
+
+The `minicore` package itself and its `__init__.py` are kept, because the
+loader reaches it through `importlib.resources.files(...)` and an absent
+package would turn a clean miss into an import error.
+
 ## What is checked
 
 The port's check phase runs against each interpreter it builds for, without
@@ -147,7 +183,7 @@ needing a Snowflake account or any credentials in CI:
 | version is the one this port builds | a stale wheel surviving in `dist/` |
 | the Arrow C++ extension was not compiled in | a dropped environment variable silently re-enabling the unverified decoder |
 | the connector falls back to the JSON result format | the extension absent but the fallback not engaging |
-| the installed connector is pure Python | a compiled object in a tree three interpreters share |
+| the installed connector is pure Python | a compiled object in a tree three interpreters share — this is what caught the nine platforms of vendored minicore binaries |
 | the DB-API 2.0 surface is present | a wheel that imports but is unusable |
 | the type converter binds Python values | an encoding fault in the bind path |
 | a 64-bit integer binds identically on big-endian | a byte-order mistake wider than 32 bits |

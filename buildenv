@@ -100,6 +100,85 @@ zopen_get_version() {
   echo "${SNOWFLAKE_VERSION}"
 }
 
+# Drop the prebuilt native libraries upstream ships for other platforms.
+#
+# The connector vendors a small native library called minicore, as a directory
+# per platform: aix_ppc64, linux_{x86_64,aarch64}_{glibc,musl}, macos_{x86_64,
+# aarch64}, windows_x86_64. None of them is z/OS and none of them can load
+# here. setup.py knows to strip the ones it does not need -- PlatformBuildPy
+# calls _prune_minicore() -- but it gives up when it cannot identify the
+# platform it is on:
+#
+#     keep = _minicore_native_subdir()
+#     if keep is None:
+#         return
+#
+# and _minicore_native_subdir() returns None for any machine that is not
+# x86_64, aarch64 or ppc64. So on z/OS the "keep only the native one" path
+# turns into "keep all nine", and the wheel comes out at 14 MB instead of
+# 1.2 MB -- most of it an AIX static archive of 17 MB uncompressed.
+#
+# Removing the platform directories rather than patching the pruner keeps this
+# independent of how upstream spells the check. The package directory and its
+# __init__.py stay, because the loader reaches minicore through
+# importlib.resources.files("snowflake.connector.minicore") and an absent
+# package would turn a miss into an import error.
+#
+# Nothing needs the library. snowflake/connector/__init__.py already treats it
+# as optional:
+#
+#     try:
+#         _core_loader.load()
+#     except Exception:
+#         # This ensures the connector module loads even if the minicore
+#         # library is unavailable
+#         pass
+#
+# so a minicore with no matching platform is a supported state, not a broken
+# one. The "installed connector is pure Python" check asserts the result.
+zopen_pre_build() {
+  # Do not assume the working directory. It is the source tree by the time the
+  # build itself runs, but this hook is earlier and a wrong guess here would
+  # silently prune nothing -- which is exactly the failure this is preventing.
+  _mc_root=""
+  for _mc_cand in "${PWD}" "${ZOPEN_ROOT}/${sourcedir}"; do
+    if [ -d "${_mc_cand}/src/snowflake/connector/minicore" ]; then
+      _mc_root="${_mc_cand}"
+      break
+    fi
+  done
+
+  if [ -z "${_mc_root}" ]; then
+    # Upstream may have stopped shipping these, in which case there is nothing
+    # to do -- but say so, because the alternative is that the tree moved and
+    # this hook is quietly a no-op.
+    printInfo "- no minicore directory found; nothing to prune"
+    return 0
+  fi
+
+  _mc_dir="${_mc_root}/src/snowflake/connector/minicore"
+  _mc_removed=0
+  for _mc_entry in "${_mc_dir}"/*; do
+    [ -d "${_mc_entry}" ] || continue
+    case "$(basename "${_mc_entry}")" in
+      __*) continue ;;
+    esac
+    rm -rf "${_mc_entry}" || {
+      printSoftError "Could not remove ${_mc_entry}"
+      return 1
+    }
+    _mc_removed=$((_mc_removed + 1))
+  done
+
+  if [ ! -f "${_mc_dir}/__init__.py" ]; then
+    printSoftError "minicore/__init__.py is missing; the resource lookup would fail"
+    return 1
+  fi
+
+  printInfo "- pruned ${_mc_removed} non-z/OS minicore platform director(ies)"
+  return 0
+}
+
 # The connector's pure-Python runtime dependencies, as its own metadata gives
 # them. Kept in one place because the check and the bundle must agree: a
 # dependency the check installs but the bundle omits is one the tests prove
