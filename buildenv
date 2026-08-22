@@ -460,8 +460,21 @@ ZZ
 zopen_post_install() {
   printHeader "Bundling the connector's pure-Python runtime dependencies"
 
+  # Resolve an interpreter and call pip through it. This hook runs with no venv
+  # active, so a bare `pip` is not on PATH and the failure says nothing about
+  # why:
+  #
+  #   pip: zopen_post_install 8: install 24: ... FSUM7351 not found
+  _pi_py=$(_zopen_python_interpreter_path "$(_zopen_python_versions | head -1 | awk '{print $1}')" 2> /dev/null)
+  [ -x "${_pi_py}" ] || _pi_py=$(command -v python3 2> /dev/null)
+  if [ ! -x "${_pi_py}" ]; then
+    printSoftError "No interpreter available to bundle the runtime dependencies"
+    return 1
+  fi
+  printInfo "- bundling with ${_pi_py}"
+
   # shellcheck disable=SC2046
-  pip install --disable-pip-version-check --quiet --only-binary=:all: \
+  "${_pi_py}" -m pip install --disable-pip-version-check --quiet --only-binary=:all: \
     --extra-index-url https://repo.zopen.community/pypi/wheels/simple/ \
     --target="${ZOPEN_INSTALL_DIR}/lib/python" \
     $(_snowflake_runtime_deps) \
@@ -481,8 +494,6 @@ zopen_post_install() {
   # The check that does not care how any of them is laid out on disk: they have
   # to import. Not every distribution name is its module name, so this lists
   # modules, not requirements.
-  _pi_py=$(_zopen_python_interpreter_path "$(_zopen_python_versions | head -1 | awk '{print $1}')" 2> /dev/null)
-  [ -x "${_pi_py}" ] || _pi_py=$(command -v python3 2> /dev/null)
   if [ -x "${_pi_py}" ]; then
     if PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" "${_pi_py}" -c \
         'import asn1crypto, OpenSSL, jwt, pytz, requests, packaging, charset_normalizer, idna, certifi, typing_extensions, filelock, sortedcontainers, platformdirs, tomlkit' 2> /dev/null; then
