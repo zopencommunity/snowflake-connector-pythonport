@@ -1,0 +1,207 @@
+# snowflake-connector-python for z/OS
+
+The [Snowflake Connector for Python](https://github.com/snowflakedb/snowflake-connector-python),
+ported to z/OS as a pure-Python wheel.
+
+DB-API 2.0, key-pair and password authentication, and the full cursor surface
+all work. Query results come back as JSON rather than Arrow — see
+[Result format](#result-format), which is the one behavioural difference from
+the connector on any other platform.
+
+## Installing
+
+With zopen:
+
+```sh
+zopen install snowflake-connector-python
+```
+
+With pip:
+
+```sh
+export PIP_EXTRA_INDEX_URL="https://repo.zopen.community/pypi/wheels/simple/"
+pip install --only-binary=:all: snowflake-connector-python
+```
+
+`--only-binary=:all:` is not optional here. `cryptography` needs `cffi`, there
+is no buildable `cffi` on z/OS — libffi has no XPLINK backend — and the only
+z/OS `cffi` is the prebuilt wheel on the zopen index. PyPI always carries a
+newer `cffi` than the index does, pip prefers the newest version, and the
+newest resolves to an sdist that dies on a missing `ffi.h`:
+
+```
+src/c/_cffi_backend.c:15:10: fatal error: 'ffi.h' file not found
+```
+
+`--only-binary=:all:` makes pip skip any version it cannot find a compatible
+wheel for, so it falls back to the version the index actually has.
+
+> **Note**
+> The documented `PIP_CONSTRAINT` file is not currently a substitute for this.
+> At the time of writing it pins only three packages and does not mention
+> `cffi`. See [Known issue: the published constraints file](#known-issue-the-published-constraints-file).
+
+## Using it
+
+```python
+import snowflake.connector
+
+conn = snowflake.connector.connect(
+    account="<account_identifier>",
+    user="<user>",
+    password="<password>",
+    warehouse="<warehouse>",
+    database="<database>",
+    schema="<schema>",
+)
+
+with conn.cursor() as cur:
+    cur.execute("select current_version()")
+    print(cur.fetchone()[0])
+
+conn.close()
+```
+
+Key-pair authentication, which is usually the better fit for a batch job:
+
+```python
+from cryptography.hazmat.primitives import serialization
+
+with open("rsa_key.p8", "rb") as fh:
+    key = serialization.load_pem_private_key(fh.read(), password=None)
+
+conn = snowflake.connector.connect(
+    account="<account_identifier>",
+    user="<user>",
+    private_key=key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ),
+)
+```
+
+## Result format
+
+This connector is built without its optional C++ result-set decoder, so it asks
+Snowflake for the JSON result format instead of Arrow. The fallback is
+automatic — there is nothing to configure — and the connector notes it at debug
+level:
+
+```
+Cannot use arrow result format, fallback to json format
+```
+
+Everything returns the same values it would anywhere else. Large result sets
+parse more slowly than they would with the Arrow decoder.
+
+Two consequences worth knowing:
+
+* `fetch_pandas_all()` and `fetch_pandas_batches()` are unavailable. They are
+  Arrow-only and raise `NotSupportedError` rather than returning bad data.
+  Use `fetchall()` and build the DataFrame yourself.
+* `write_pandas()` is unaffected.
+
+### Why Arrow is off
+
+Not because it fails to build — because getting it *subtly* wrong is worse than
+not having it.
+
+Arrow's IPC format is little-endian by definition, and z/OS is big-endian, so
+every buffer has to be byte-swapped on the way in. nanoarrow knows this;
+`ArrowIpcDecoderNeedsSwapEndian()` compares the stream's endianness against the
+system's, so the path exists and is not obviously wrong. It has simply never
+been exercised on this platform, and a decoder that swaps *almost* correctly
+returns wrong numbers rather than an error. In a database driver that is the
+worst bug available, and the only thing it buys is faster parsing.
+
+Upstream ships that decoder as a vendored nanoarrow plus flatcc and 24
+converter sources behind a Cython module. It is genuinely optional: `setup.py`
+skips it when `SNOWFLAKE_DISABLE_COMPILE_ARROW_EXTENSIONS` is set, and
+`cursor.py` catches the `ImportError`, sets `CAN_USE_ARROW_RESULT_FORMAT` to
+`False`, and switches the session to JSON.
+
+Turning it on is a contained change for whoever wants to do the work: set the
+variable to `false` in `buildenv`, add `cython>=3.1` to the build venv, and
+prove the swap path with a round-trip against a real account — big integers,
+decimals, timestamps and binary columns in particular. Until someone does that,
+it stays off, and the port's check asserts the extension is absent so it cannot
+come back by accident.
+
+## Why this port exists
+
+PyPI has no `py3-none-any` wheel for this package — only manylinux, macOS and
+Windows binaries — so pip on z/OS falls through to the sdist. The sdist's
+`[build-system]` requires names `cython>=3.1`; an isolated build installs it;
+`_ABLE_TO_COMPILE_EXTENSIONS` comes out true; and pip tries to compile the C++
+decoder. This port is what stops that happening by accident, and it publishes a
+`py3-none-any` wheel so every interpreter shares one artifact.
+
+## What is checked
+
+The port's check phase runs against each interpreter it builds for, without
+needing a Snowflake account or any credentials in CI:
+
+| check | what it would catch |
+| --- | --- |
+| version is the one this port builds | a stale wheel surviving in `dist/` |
+| the Arrow C++ extension was not compiled in | a dropped environment variable silently re-enabling the unverified decoder |
+| the connector falls back to the JSON result format | the extension absent but the fallback not engaging |
+| the installed connector is pure Python | a compiled object in a tree three interpreters share |
+| the DB-API 2.0 surface is present | a wheel that imports but is unusable |
+| the type converter binds Python values | an encoding fault in the bind path |
+| a 64-bit integer binds identically on big-endian | a byte-order mistake wider than 32 bits |
+| native byte order is big-endian | the check running somewhere it does not mean anything |
+| key-pair auth primitives work | a broken ported `cryptography`, or `jwt` |
+| the CA bundle is present and readable | TLS failing only at connect time |
+| optional dependencies degrade instead of raising | `boto3` absence turning into an import error |
+
+## Dependencies
+
+`cryptography` is the only runtime dependency that is not pure Python — it is a
+Rust extension with a per-interpreter ABI — so it comes from its own zopen port
+and is declared in `ZOPEN_RUNTIME_DEPS`.
+
+Everything else the connector needs is pure Python and is bundled into
+`lib/python` at install time, because none of it is a zopen port and one copy
+can safely serve all three interpreters.
+
+`boto3` and `botocore` are bundled because the connector's own metadata lists
+them, not because importing it needs them: `options.py` routes both through
+`MissingOptionalDependency`, so their absence surfaces only when you transfer
+to an S3-backed stage. They are also most of the bundle's size — `botocore`
+alone is about 16 MB. Dropping them is safe if that ever matters more than
+completeness, and the failure it introduces is a clear one.
+
+## Known issue: the published constraints file
+
+The zopen Python documentation tells you to use `PIP_CONSTRAINT` alongside the
+wheel index:
+
+```sh
+export PIP_EXTRA_INDEX_URL="https://repo.zopen.community/pypi/wheels/simple/"
+export PIP_CONSTRAINT="https://repo.zopen.community/pulp/content/constraints/zopen-constraints.txt"
+```
+
+At the time of writing that file pins only `bcrypt`, `jellyfish` and `psutil`,
+while the wheel index serves 37 packages. `cffi` and `cryptography` are both in
+the index and neither is pinned, which is why the `pip install` instructions
+above use `--only-binary=:all:` instead of relying on the constraints file.
+
+The cause is that the constraints file is generated from whichever wheel index
+the publish job ran against, and published to a single fixed location shared by
+both build lines — so a `DEV` publish, whose index carries three packages,
+overwrites the `STABLE` one. This is a `meta` issue rather than a problem with
+this port; `--only-binary=:all:` is correct either way and does not go stale
+when the file is fixed.
+
+## Building
+
+```sh
+zopen build -v
+```
+
+The build is pure Python and needs no compiler. `SNOWFLAKE_DISABLE_COMPILE_ARROW_EXTENSIONS`,
+`ZOPEN_PYTHON_BUILD_ISOLATION=false` and `ZOPEN_PYTHON_BUILD_SKIP_DEP_CHECK=true`
+are set in `buildenv` and are load-bearing; the note at the top of that file
+explains what each one is holding up.

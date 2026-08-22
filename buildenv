@@ -1,0 +1,454 @@
+### The Snowflake Connector for Python is pure Python on this platform, and the
+### whole point of this port is to make sure it stays that way.
+###
+### Upstream ships a C++ result-set decoder: a vendored copy of nanoarrow plus
+### flatcc and 24 converter sources, reached through a Cython module called
+### snowflake.connector.nanoarrow_arrow_iterator. It decodes the Arrow-format
+### result chunks Snowflake returns. It is genuinely optional -- setup.py skips
+### it when SNOWFLAKE_DISABLE_COMPILE_ARROW_EXTENSIONS is set, and cursor.py
+### catches the ImportError, sets CAN_USE_ARROW_RESULT_FORMAT to False and asks
+### the server for JSON instead:
+###
+###   if not CAN_USE_ARROW_RESULT_FORMAT:
+###       logger.debug("Cannot use arrow result format, fallback to json format")
+###       statement_params = {PARAMETER_PYTHON_CONNECTOR_QUERY_RESULT_FORMAT: "JSON"}
+###
+### so a connector without it is a working connector, not a crippled one. That
+### is the build this port produces, and the resulting wheel is
+### py3-none-any: one artifact for every interpreter.
+###
+### Why disable it rather than try. Two reasons, in order of importance:
+###
+###   1. Arrow's IPC format is little-endian by definition and this is a
+###      big-endian machine, so every buffer has to be byte-swapped on the way
+###      in. nanoarrow knows this -- ArrowIpcDecoderNeedsSwapEndian() compares
+###      the stream's endianness against the system's -- so the path exists and
+###      is not obviously wrong. It is simply not a path anyone has run here,
+###      and the failure mode of getting it subtly wrong is silently incorrect
+###      query results. That is the worst possible bug in a database driver and
+###      it is not worth risking for a decode speedup.
+###
+###   2. Nothing needs it. JSON results are slower to parse, not less correct.
+###
+### Turning it on later is a contained change: set the variable to false, add
+### cython>=3.1 to the build venv, and prove the swap path with a round-trip
+### against a real account. Until someone does that, this stays off.
+###
+### What pip does without this port, and why the port exists at all. PyPI has
+### no py3-none-any wheel for this package -- only manylinux/macos/windows
+### binaries -- so pip on z/OS falls through to the sdist. The sdist's
+### [build-system] requires names cython>=3.1, an isolated build installs it,
+### _ABLE_TO_COMPILE_EXTENSIONS comes out true, and pip tries to compile the
+### C++ decoder. This port is what stops that happening by accident.
+###
+### cffi is the other thing that bites. cryptography needs it, there is no
+### buildable cffi on this platform (libffi has no XPLINK backend), and the
+### only z/OS cffi is the prebuilt wheel on the zopen index. PyPI always has a
+### newer cffi, pip prefers newest, and the newest resolves to an sdist that
+### dies on a missing ffi.h. Every pip call below therefore passes
+### --only-binary=:all:, which makes pip skip any version it cannot get a
+### compatible wheel for and fall back to the one the index carries. That is
+### deliberately not a version pin: a pin goes stale the day the index moves.
+
+SNOWFLAKE_VERSION="4.7.2"
+
+# bump: snowflake-version /SNOWFLAKE_VERSION="(.*)"/ https://github.com/snowflakedb/snowflake-connector-python.git|semver:*
+
+export ZOPEN_STABLE_URL="https://github.com/snowflakedb/snowflake-connector-python.git"
+export ZOPEN_STABLE_TAG="v${SNOWFLAKE_VERSION}"
+export ZOPEN_STABLE_DEPS="check_python curl git"
+
+export ZOPEN_DEV_URL="https://github.com/snowflakedb/snowflake-connector-python.git"
+export ZOPEN_DEV_DEPS="${ZOPEN_STABLE_DEPS}"
+
+# cryptography is the one runtime dependency that is not pure Python: it is a
+# Rust extension, built per interpreter, and shipped by its own zopen port.
+# Everything else this connector needs is pure Python and is bundled by
+# zopen_post_install below -- see the note there for why the split falls here.
+export ZOPEN_RUNTIME_DEPS="check_python cryptography"
+
+export ZOPEN_CATEGORIES="development library database"
+
+export ZOPEN_PYTHON_VERSIONS="${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}"
+export ZOPEN_BUILD_SYSTEM="Python"
+
+# The switch this whole port turns on. setup.py reads it as a string and
+# accepts y/yes/t/true/1/on; anything else leaves the extension enabled.
+export SNOWFLAKE_DISABLE_COMPILE_ARROW_EXTENSIONS="true"
+
+# Build in the venv rather than a fresh PyPI-resolved environment. Isolation
+# would fetch cython>=3.1 from PyPI purely to satisfy [build-system], which is
+# both pointless -- the variable above means it goes unused -- and the one
+# thing that could quietly re-enable the C++ decoder if that variable were ever
+# dropped. Not installing cython is the belt to the variable's braces.
+export ZOPEN_PYTHON_BUILD_ISOLATION="false"
+
+# Required consequence of the above: without isolation, 'build' still validates
+# [build-system] requires against the venv and would stop on the missing
+# cython. The requirement is real for the extension build and irrelevant to
+# this one.
+export ZOPEN_PYTHON_BUILD_SKIP_DEP_CHECK="true"
+
+zopen_get_version() {
+  echo "${SNOWFLAKE_VERSION}"
+}
+
+# The connector's pure-Python runtime dependencies, as its own metadata gives
+# them. Kept in one place because the check and the bundle must agree: a
+# dependency the check installs but the bundle omits is one the tests prove
+# nothing about.
+#
+# boto3/botocore are in this list because Requires-Dist has them, not because
+# importing the connector needs them -- options.py routes both through
+# MissingOptionalDependency, so their absence surfaces only if you actually
+# transfer to an S3-backed stage. They are also most of the bundle's size
+# (botocore alone is ~16 MB). If that ever matters more than completeness,
+# dropping them is safe and the failure it introduces is a clear one.
+_snowflake_runtime_deps() {
+  echo "asn1crypto<2.0.0,>0.24.0" \
+       "pyOpenSSL>=24.0.0" \
+       "pyjwt<3.0.0,>=2.10.1" \
+       "pytz" \
+       "requests<3.0.0,>=2.32.4" \
+       "packaging" \
+       "charset_normalizer<4,>=2" \
+       "idna<4,>=3.7" \
+       "certifi>=2024.7.4" \
+       "typing_extensions<5,>=4.3" \
+       "filelock<4,>=3.5" \
+       "sortedcontainers>=2.4.0" \
+       "platformdirs<5.0.0,>=2.6.0" \
+       "tomlkit" \
+       "boto3>=1.24" \
+       "botocore>=1.24"
+}
+
+# zopen-build installs the wheel with --no-deps, so the check venv has the
+# connector and nothing it needs. Install that here rather than in a build
+# hook: this runs once per interpreter with that interpreter's venv already
+# active, which is exactly the environment the checks are supposed to describe.
+zopen_python_test() {
+  # cryptography comes from the zopen index; everything else is a pure wheel on
+  # PyPI. --only-binary=:all: is what keeps cffi resolvable -- see the note at
+  # the top of this file.
+  # shellcheck disable=SC2046
+  pip install --disable-pip-version-check --quiet --only-binary=:all: \
+    --extra-index-url https://repo.zopen.community/pypi/wheels/simple/ \
+    $(_snowflake_runtime_deps) "cryptography>=46.0.5" \
+    || { printSoftError "Could not install the connector's runtime dependencies"; return 1; }
+
+  SNOWFLAKE_EXPECTED_VERSION="${SNOWFLAKE_VERSION}" python - <<'PYEOF'
+import os
+import sys
+
+# Deliberately not the wording zopen-build prints for its own per-interpreter
+# header: zopen_check_results counts that header to notice an interpreter that
+# died before its first check, and a second line matching it would be read as
+# a crash that never happened.
+print("Interpreter: Python %s" % sys.version.split()[0])
+
+# zopen builds PYTHONPATH as "${PYTHONPATH}:..." from a variable that starts
+# unset, leaving a leading empty entry that Python expands to the working
+# directory -- which during the check is the source tree, and the source tree
+# has a src/snowflake/ in it.
+sys.path = [p for p in sys.path if p not in ("", os.getcwd())]
+
+passed = 0
+failed = 0
+
+
+def check(name, fn):
+    global passed, failed
+    try:
+        fn()
+    except Exception as exc:
+        print("FAIL: %s -- %s: %s" % (name, type(exc).__name__, exc))
+        failed += 1
+    else:
+        print("PASS: %s" % name)
+        passed += 1
+
+
+import snowflake.connector as sc
+
+expected = os.environ["SNOWFLAKE_EXPECTED_VERSION"]
+
+
+def version_is_ours():
+    if sc.__version__ != expected:
+        raise AssertionError("imported %s, this port builds %s"
+                             % (sc.__version__, expected))
+
+
+check("version is the one this port builds", version_is_ours)
+
+
+# The claim this port is built on. If the C++ decoder ever does get compiled in
+# by accident -- a dropped environment variable, an isolated build that pulled
+# cython -- this is the check that says so, and it says so before anyone runs a
+# query whose numbers come back byte-swapped.
+def arrow_extension_is_absent():
+    import importlib.util
+    spec = importlib.util.find_spec("snowflake.connector.nanoarrow_arrow_iterator")
+    if spec is not None:
+        raise AssertionError(
+            "the nanoarrow C++ extension is present at %s; this port is meant to "
+            "build without it and its byte-swap path is unverified on this "
+            "platform" % (spec.origin,))
+
+
+check("the Arrow C++ extension was not compiled in", arrow_extension_is_absent)
+
+
+def falls_back_to_json():
+    from snowflake.connector.cursor import CAN_USE_ARROW_RESULT_FORMAT
+    if CAN_USE_ARROW_RESULT_FORMAT:
+        raise AssertionError("CAN_USE_ARROW_RESULT_FORMAT is True without the "
+                             "extension, so the JSON fallback will not engage")
+
+
+check("the connector falls back to the JSON result format", falls_back_to_json)
+
+
+def is_pure_python():
+    import snowflake.connector
+    root = os.path.dirname(snowflake.connector.__file__)
+    found = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if name.endswith((".so", ".x")):
+                found.append(os.path.join(dirpath, name))
+    if found:
+        raise AssertionError("compiled objects in an installed tree that should "
+                             "be pure Python: %s" % ", ".join(found))
+
+
+check("the installed connector is pure Python", is_pure_python)
+
+
+# A wheel that imports but cannot present the DB-API surface is no use, and
+# these are the names every caller and every ORM adapter reaches for first.
+def dbapi_surface():
+    for attr in ("connect", "apilevel", "threadsafety", "paramstyle",
+                 "Error", "DatabaseError", "ProgrammingError",
+                 "OperationalError", "IntegrityError", "InterfaceError"):
+        if not hasattr(sc, attr):
+            raise AssertionError("missing DB-API attribute %r" % attr)
+    if sc.apilevel != "2.0":
+        raise AssertionError("apilevel is %r, expected '2.0'" % sc.apilevel)
+
+
+check("the DB-API 2.0 surface is present", dbapi_surface)
+
+
+# Everything below is reachable without a Snowflake account, which is the
+# point: these are the parts of the connector that this platform could plausibly
+# break, exercised without needing credentials in CI.
+def type_converter_round_trips():
+    from snowflake.connector.converter import SnowflakeConverter
+    conv = SnowflakeConverter()
+    # to_snowflake is the direction that turns Python values into bind
+    # parameters, and it is where a byte-order or encoding fault would show.
+    for value in (1, -1, 2 ** 40, 3.5, "text", True):
+        fn = conv.to_snowflake_bindings(
+            conv.snowflake_type(value), value)
+        if fn is None:
+            raise AssertionError("no binding for %r" % (value,))
+
+
+check("the type converter binds Python values", type_converter_round_trips)
+
+
+def big_endian_int_binding():
+    # Snowflake binds integers as decimal strings, so a big-endian machine must
+    # produce the same text a little-endian one would. A value wider than 32
+    # bits is the one that catches a struct/byte-order mistake.
+    from snowflake.connector.converter import SnowflakeConverter
+    conv = SnowflakeConverter()
+    value = 1234567890123456789
+    fn = conv.to_snowflake_bindings(conv.snowflake_type(value), value)
+    if str(fn) != str(value):
+        raise AssertionError("bound %r as %r" % (value, fn))
+
+
+check("a 64-bit integer binds identically on big-endian", big_endian_int_binding)
+
+
+def byte_order_is_big():
+    if sys.byteorder != "big":
+        raise AssertionError("expected a big-endian interpreter, got %s"
+                             % sys.byteorder)
+
+
+check("native byte order is big-endian", byte_order_is_big)
+
+
+# Key-pair authentication is the mechanism most likely to be used from a batch
+# job on this platform, and it is the one that depends on the ported
+# cryptography and on jwt. Generating a key and signing a token exercises both
+# without contacting Snowflake.
+def keypair_auth_primitives():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    import jwt
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    der = key.private_bytes(serialization.Encoding.DER,
+                            serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption())
+    if len(der) < 512:
+        raise AssertionError("PKCS8 DER is implausibly short: %d bytes" % len(der))
+    token = jwt.encode({"sub": "zopen"}, "secret", algorithm="HS256")
+    if jwt.decode(token, "secret", algorithms=["HS256"])["sub"] != "zopen":
+        raise AssertionError("JWT did not round-trip")
+
+
+check("key-pair auth primitives work", keypair_auth_primitives)
+
+
+def tls_trust_store_is_readable():
+    # The connector will not open a connection it cannot verify, and a missing
+    # or unreadable CA bundle is a failure that only shows at connect time.
+    import certifi
+    path = certifi.where()
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    if b"BEGIN CERTIFICATE" not in blob:
+        raise AssertionError("no PEM certificates in %s" % path)
+
+
+check("the CA bundle is present and readable", tls_trust_store_is_readable)
+
+
+def optional_deps_degrade():
+    # boto3 is declared but routed through MissingOptionalDependency. Whether
+    # it is installed or not, importing the module that uses it must not raise.
+    import snowflake.connector.platform_detection  # noqa: F401
+
+
+check("optional dependencies degrade instead of raising", optional_deps_degrade)
+
+print("snowflake-connector-python %s on Python %s -- %d passed, %d failed"
+      % (sc.__version__, sys.version.split()[0], passed, failed))
+sys.exit(1 if failed else 0)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 when nothing matches and also exits 1, so
+  # the fallback appends a second zero and the arithmetic dies.
+  passed=$(grep -c "^PASS:" "${chk}" 2> /dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2> /dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+
+  # An interpreter whose script dies before the first check contributes no PASS
+  # and no FAIL, so counting those alone would score a crash as a clean run.
+  interpreters=$(grep -c "Running tests with Python" "${chk}" 2> /dev/null)
+  reported=$(grep -c "^snowflake-connector-python .* on Python" "${chk}" 2> /dev/null)
+  interpreters=${interpreters:-0}
+  reported=${reported:-0}
+  silent=$((interpreters - reported))
+  if [ "${silent}" -gt 0 ]; then
+    failed=$((failed + silent))
+  fi
+
+cat <<ZZ
+actualFailures:${failed}
+totalTests:$((passed + failed))
+expectedFailures:0
+ZZ
+}
+
+# The connector's pure-Python dependencies are not zopen ports and are not on
+# the wheel index, so an installed tree without them cannot import. Bundling
+# them here is safe for exactly the reason it is safe in the other Python
+# ports: this runs once, under the primary interpreter, into a lib/python that
+# every interpreter this port serves shares -- which is only sound while every
+# bundled file is pure Python. That is asserted below rather than assumed.
+#
+# cryptography is deliberately not bundled. It is a Rust extension with a
+# per-interpreter ABI, so one copy cannot serve three interpreters; it is a
+# zopen port and is declared in ZOPEN_RUNTIME_DEPS instead.
+zopen_post_install() {
+  printHeader "Bundling the connector's pure-Python runtime dependencies"
+
+  # shellcheck disable=SC2046
+  pip install --disable-pip-version-check --quiet --only-binary=:all: \
+    --extra-index-url https://repo.zopen.community/pypi/wheels/simple/ \
+    --target="${ZOPEN_INSTALL_DIR}/lib/python" \
+    $(_snowflake_runtime_deps) \
+    || { printSoftError "Could not bundle the runtime dependencies"; return 1; }
+
+  # Anything compiled would have been built for one interpreter and imported by
+  # three. This is the assertion the paragraph above depends on.
+  _pi_ext=$(find "${ZOPEN_INSTALL_DIR}/lib/python" -name "*.so" -o -name "*.x" 2> /dev/null | wc -l | tr -d ' ')
+  if [ "${_pi_ext}" != "0" ]; then
+    printSoftError "the bundle contains ${_pi_ext} compiled object(s); it must be pure Python"
+    find "${ZOPEN_INSTALL_DIR}/lib/python" \( -name "*.so" -o -name "*.x" \) 2> /dev/null \
+      | while read -r _pi_bad; do printSoftError "  ${_pi_bad}"; done
+    return 1
+  fi
+  printInfo "- bundle is pure Python"
+
+  # The check that does not care how any of them is laid out on disk: they have
+  # to import. Not every distribution name is its module name, so this lists
+  # modules, not requirements.
+  _pi_py=$(_zopen_python_interpreter_path "$(_zopen_python_versions | head -1 | awk '{print $1}')" 2> /dev/null)
+  [ -x "${_pi_py}" ] || _pi_py=$(command -v python3 2> /dev/null)
+  if [ -x "${_pi_py}" ]; then
+    if PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" "${_pi_py}" -c \
+        'import asn1crypto, OpenSSL, jwt, pytz, requests, packaging, charset_normalizer, idna, certifi, typing_extensions, filelock, sortedcontainers, platformdirs, tomlkit' 2> /dev/null; then
+      printInfo "- every bundled dependency imports from the bundle"
+    else
+      printSoftError "the bundled modules do not import from ${ZOPEN_INSTALL_DIR}/lib/python"
+      PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" "${_pi_py}" -c \
+        'import asn1crypto, OpenSSL, jwt, pytz, requests, packaging, charset_normalizer, idna, certifi, typing_extensions, filelock, sortedcontainers, platformdirs, tomlkit' 2>&1 \
+        | while read -r _pi_line; do printSoftError "  ${_pi_line}"; done
+      return 1
+    fi
+  else
+    printSoftError "no interpreter available to verify the bundle imports"
+  fi
+  return 0
+}
+
+# zopen-build captures stdout from here into metadata.json as installation
+# caveats. This is the only place a user who never reads the README is told
+# what they are getting, so it says the two things that change behaviour.
+zopen_install_caveats() {
+  cat <<'CAVEATEOF'
+Query results come back as JSON, not Arrow.
+
+This connector is built without its optional C++ result-set decoder, so it asks
+Snowflake for the JSON result format. Everything works; large result sets parse
+more slowly than they would elsewhere. Nothing needs configuring -- the fallback
+is automatic and the connector logs it at debug level:
+
+    Cannot use arrow result format, fallback to json format
+
+The reason is byte order. Arrow's IPC format is little-endian by definition and
+this is a big-endian machine, so every buffer needs swapping on the way in. That
+path exists in nanoarrow but has never been exercised here, and a decoder that
+is subtly wrong returns wrong numbers rather than an error. It is off until
+someone verifies it against a real account.
+
+Consequences worth knowing:
+
+  * fetch_pandas_all() and fetch_pandas_batches() are unavailable. They are
+    Arrow-only, and raise NotSupportedError rather than returning bad data.
+    Use fetchall() and build the DataFrame yourself.
+  * write_pandas() is unaffected.
+
+Installing with pip rather than zopen needs two things, because there is no
+buildable cffi on this platform and PyPI always has a newer one than the
+prebuilt wheel:
+
+    export PIP_EXTRA_INDEX_URL="https://repo.zopen.community/pypi/wheels/simple/"
+    pip install --only-binary=:all: snowflake-connector-python
+
+--only-binary=:all: is what makes pip skip the versions it has no z/OS wheel for
+instead of trying to compile them.
+CAVEATEOF
+}
