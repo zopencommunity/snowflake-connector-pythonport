@@ -72,6 +72,13 @@ export ZOPEN_CATEGORIES="development library database"
 export ZOPEN_PYTHON_VERSIONS="${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}"
 export ZOPEN_BUILD_SYSTEM="Python"
 
+# Nothing here is compiled, and without this zopen-build still tries to build
+# its zoslib environment hooks with an unset compiler:
+#
+#   -DPATH_MAX=1024: eval: ... FSUM7351 not found
+#   ***ERROR: Compiler command for zoslib_env_hook.c failed to compile
+export ZOPEN_COMP="skip"
+
 # The switch this whole port turns on. setup.py reads it as a string and
 # accepts y/yes/t/true/1/on; anything else leaves the extension enabled.
 export SNOWFLAKE_DISABLE_COMPILE_ARROW_EXTENSIONS="true"
