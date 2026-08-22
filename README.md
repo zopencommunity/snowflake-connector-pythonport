@@ -16,30 +16,46 @@ With zopen:
 zopen install snowflake-connector-python
 ```
 
-With pip:
+With pip, the normal zopen way:
 
 ```sh
 export PIP_EXTRA_INDEX_URL="https://repo.zopen.community/pypi/wheels/simple/"
-pip install --only-binary=:all: snowflake-connector-python
+export PIP_CONSTRAINT="https://repo.zopen.community/pulp/content/constraints/zopen-constraints.txt"
+pip install snowflake-connector-python
 ```
 
-`--only-binary=:all:` is not optional here. `cryptography` needs `cffi`, there
-is no buildable `cffi` on z/OS — libffi has no XPLINK backend — and the only
-z/OS `cffi` is the prebuilt wheel on the zopen index. PyPI always carries a
-newer `cffi` than the index does, pip prefers the newest version, and the
-newest resolves to an sdist that dies on a missing `ffi.h`:
+Both variables matter. `cryptography` needs `cffi`, there is no buildable
+`cffi` on z/OS — libffi has no XPLINK backend — and the only z/OS `cffi` is the
+prebuilt wheel on the zopen index. PyPI always carries a newer `cffi`, pip
+resolves by version across both indexes, and the newer one resolves to an sdist
+that dies on a missing `ffi.h`:
 
 ```
 src/c/_cffi_backend.c:15:10: fatal error: 'ffi.h' file not found
 ```
 
-`--only-binary=:all:` makes pip skip any version it cannot find a compatible
-wheel for, so it falls back to the version the index actually has.
+The constraints file pins `cffi` to the version the index serves, which stops
+that.
 
 > **Note**
-> The documented `PIP_CONSTRAINT` file is not currently a substitute for this.
-> At the time of writing it pins only three packages and does not mention
-> `cffi`. See [Known issue: the published constraints file](#known-issue-the-published-constraints-file).
+> At the time of writing the published constraints file is wrong — it pins
+> three packages instead of the thirty-seven in the index, and `cffi` is not
+> among them. The cause is fixed in `meta`, but the served file stays wrong
+> until the next STABLE publish regenerates it. See
+> [Known issue](#known-issue-the-published-constraints-file).
+>
+> Until then, `--only-binary=:all:` gets a **fresh** install through:
+>
+> ```sh
+> export PIP_EXTRA_INDEX_URL="https://repo.zopen.community/pypi/wheels/simple/"
+> pip install --only-binary=:all: snowflake-connector-python
+> ```
+>
+> It makes pip skip any version it cannot find a compatible wheel for, so it
+> falls back to the one the index has. It is a weaker tool than the constraints
+> file and not a general substitute: `--only-binary` has nothing to say about a
+> package that is *already installed*. Prefer the constraints file once it is
+> serving the right content.
 
 ## Using it
 
@@ -264,12 +280,15 @@ while the wheel index serves 37 packages. `cffi` and `cryptography` are both in
 the index and neither is pinned, which is why the `pip install` instructions
 above use `--only-binary=:all:` instead of relying on the constraints file.
 
-The cause is that the constraints file is generated from whichever wheel index
-the publish job ran against, and published to a single fixed location shared by
-both build lines — so a `DEV` publish, whose index carries three packages,
-overwrites the `STABLE` one. This is a `meta` issue rather than a problem with
-this port; `--only-binary=:all:` is correct either way and does not go stale
-when the file is fixed.
+The cause was that the constraints file is generated from whichever wheel index
+the publish job ran against, but was published to a single fixed location shared
+by both build lines — so a `DEV` publish, whose index carries three packages,
+overwrote the `STABLE` one.
+
+Fixed in `meta` (`c306a6ac`): STABLE keeps the documented path and any other
+index gets its own, so `wheels-dev` now publishes to `constraints-dev`. The
+served file stays wrong until the next STABLE publish regenerates it, which is
+why the install instructions above carry a workaround.
 
 ## Building
 
