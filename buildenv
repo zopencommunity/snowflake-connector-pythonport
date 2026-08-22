@@ -435,6 +435,44 @@ def keypair_auth_primitives():
 check("key-pair auth primitives work", keypair_auth_primitives)
 
 
+# The interpreters on this platform ship their own cryptography in
+# site-packages, and it is ancient: 3.3.2 at the time of writing, against the
+# 46+ this connector requires. If that copy ever wins over the ported one the
+# symptom is not a version error but a TypeError from inside cryptography.utils
+# while importing pyOpenSSL, which names nothing useful. Assert the version
+# directly so the failure says what it is.
+def cryptography_is_the_ported_one():
+    import cryptography
+    major = int(cryptography.__version__.split(".")[0])
+    if major < 46:
+        raise AssertionError(
+            "cryptography %s from %s -- too old for this connector, and almost "
+            "certainly the copy bundled with the interpreter rather than the "
+            "ported one" % (cryptography.__version__, cryptography.__file__))
+
+
+check("cryptography is new enough to be the ported one",
+      cryptography_is_the_ported_one)
+
+
+def pyopenssl_imports():
+    # The import that fails when the wrong cryptography wins.
+    import OpenSSL.SSL  # noqa: F401
+
+
+check("pyOpenSSL imports against that cryptography", pyopenssl_imports)
+
+
+def boto_chain_imports():
+    # botocore reaches OpenSSL through urllib3.contrib.pyopenssl, so this is
+    # the same fault line one step further out.
+    import botocore.httpsession  # noqa: F401
+    import boto3  # noqa: F401
+
+
+check("the boto import chain resolves", boto_chain_imports)
+
+
 def tls_trust_store_is_readable():
     # The connector will not open a connection it cannot verify, and a missing
     # or unreadable CA bundle is a failure that only shows at connect time.
@@ -539,12 +577,21 @@ zopen_post_install() {
   # to import. Not every distribution name is its module name, so this lists
   # modules, not requirements.
   if [ -x "${_pi_py}" ]; then
-    # pyOpenSSL is deliberately not in this list. It cannot import without
-    # cryptography, which is not in the bundle by design, so importing it here
-    # would test whether the cryptography port happens to be installed on the
-    # build machine rather than whether this bundle is sound. The check phase
-    # covers it, in a venv where cryptography is present.
-    _pi_mods='import asn1crypto, jwt, pytz, requests, packaging, charset_normalizer, idna, certifi, typing_extensions, filelock, sortedcontainers, platformdirs, tomlkit, boto3, botocore, urllib3, jmespath, s3transfer, dateutil, six'
+    # pyOpenSSL, boto3 and botocore are deliberately not in this list: every one
+    # of them reaches cryptography, which is not in the bundle by design.
+    # pyOpenSSL imports it directly; botocore gets there through
+    # urllib3.contrib.pyopenssl, and boto3 through botocore.
+    #
+    # Importing them here would test the build machine's cryptography rather
+    # than this bundle, and on this platform that is an actively misleading
+    # thing to test: the IBM interpreters ship cryptography 3.3.2 in their own
+    # site-packages, which is far too old for a current pyOpenSSL and fails
+    # with a TypeError from inside cryptography.utils rather than anything
+    # naming a version.
+    #
+    # The check phase covers all three, in a venv where the ported cryptography
+    # is installed and is the one that wins.
+    _pi_mods='import asn1crypto, jwt, pytz, requests, packaging, charset_normalizer, idna, certifi, typing_extensions, filelock, sortedcontainers, platformdirs, tomlkit, urllib3, jmespath, s3transfer, dateutil, six'
     if PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" "${_pi_py}" -c "${_pi_mods}" 2> /dev/null; then
       printInfo "- every bundled dependency imports from the bundle"
     else

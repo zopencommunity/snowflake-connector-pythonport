@@ -189,6 +189,9 @@ needing a Snowflake account or any credentials in CI:
 | a 64-bit integer binds identically on big-endian | a byte-order mistake wider than 32 bits |
 | native byte order is big-endian | the check running somewhere it does not mean anything |
 | key-pair auth primitives work | a broken ported `cryptography`, or `jwt` |
+| cryptography is new enough to be the ported one | the interpreter's own cryptography 3.3.2 winning over the ported one |
+| pyOpenSSL imports against that cryptography | the version clash, at the point it actually breaks |
+| the boto import chain resolves | the same clash one step out, via `urllib3.contrib.pyopenssl` |
 | the CA bundle is present and readable | TLS failing only at connect time |
 | optional dependencies degrade instead of raising | `boto3` absence turning into an import error |
 
@@ -208,6 +211,26 @@ them, not because importing it needs them: `options.py` routes both through
 to an S3-backed stage. They are also most of the bundle's size — `botocore`
 alone is about 16 MB. Dropping them is safe if that ever matters more than
 completeness, and the failure it introduces is a clear one.
+
+## A note on the interpreter's own cryptography
+
+The IBM Open Enterprise SDK interpreters ship a copy of `cryptography` in their
+own `site-packages`, and it is old — 3.3.2 at the time of writing, against the
+46+ this connector requires. The ported `cryptography` is the one that should
+win, and does.
+
+It is worth knowing because of how it fails if it ever does not. You do not get
+a version error; you get a `TypeError` from inside `cryptography.utils` while
+importing pyOpenSSL:
+
+```
+File ".../OpenSSL/crypto.py", line 1788, in <module>
+    utils.deprecated(
+TypeError: deprecated() got an unexpected keyword argument 'name'
+```
+
+which names neither package nor version. The port's checks assert the version
+directly so that this surfaces as what it is.
 
 ## Known issue: the published constraints file
 
