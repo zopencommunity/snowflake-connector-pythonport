@@ -179,10 +179,9 @@ zopen_pre_build() {
   return 0
 }
 
-# The connector's pure-Python runtime dependencies, as its own metadata gives
-# them. Kept in one place because the check and the bundle must agree: a
-# dependency the check installs but the bundle omits is one the tests prove
-# nothing about.
+# The connector's direct runtime dependencies, as its own metadata gives them.
+# Used by the check, where pip resolves the closure itself and cryptography is
+# meant to be pulled in.
 #
 # boto3/botocore are in this list because Requires-Dist has them, not because
 # importing the connector needs them -- options.py routes both through
@@ -207,6 +206,50 @@ _snowflake_runtime_deps() {
        "tomlkit" \
        "boto3>=1.24" \
        "botocore>=1.24"
+}
+
+# What the bundle installs, which is deliberately not the list above.
+#
+# The bundle is built with --no-deps and therefore has to name the whole pure
+# closure itself, transitive entries included. Letting pip resolve it instead
+# looks simpler and is wrong: pyOpenSSL depends on cryptography, cryptography
+# depends on cffi, and both are compiled, so a resolving install quietly drops
+# two per-interpreter .so files into a tree three interpreters share --
+#
+#   the bundle contains 2 compiled object(s); it must be pure Python
+#     .../lib/python/_cffi_backend.cpython-312.so
+#     .../lib/python/cryptography/hazmat/bindings/_rust.cpython-312.so
+#
+# which is the purity assertion below doing its job. Naming the closure makes
+# the bundle's contents explicit and auditable, and keeps cryptography coming
+# from its own port for every interpreter rather than from here for one.
+#
+# The five names that are not in the list above are all transitive: urllib3 and
+# certifi via requests, jmespath and s3transfer via boto3, python-dateutil and
+# six via botocore. Versions are left to pip except where the connector itself
+# specifies one.
+_snowflake_bundle_deps() {
+  echo "asn1crypto<2.0.0,>0.24.0" \
+       "pyOpenSSL>=24.0.0" \
+       "pyjwt<3.0.0,>=2.10.1" \
+       "pytz" \
+       "requests<3.0.0,>=2.32.4" \
+       "packaging" \
+       "charset_normalizer<4,>=2" \
+       "idna<4,>=3.7" \
+       "certifi>=2024.7.4" \
+       "typing_extensions<5,>=4.3" \
+       "filelock<4,>=3.5" \
+       "sortedcontainers>=2.4.0" \
+       "platformdirs<5.0.0,>=2.6.0" \
+       "tomlkit" \
+       "boto3>=1.24" \
+       "botocore>=1.24" \
+       "urllib3" \
+       "jmespath" \
+       "s3transfer" \
+       "python-dateutil" \
+       "six"
 }
 
 # zopen-build installs the wheel with --no-deps, so the check venv has the
@@ -473,11 +516,12 @@ zopen_post_install() {
   fi
   printInfo "- bundling with ${_pi_py}"
 
+  # --no-deps, with the closure named explicitly: see _snowflake_bundle_deps.
   # shellcheck disable=SC2046
   "${_pi_py}" -m pip install --disable-pip-version-check --quiet --only-binary=:all: \
-    --extra-index-url https://repo.zopen.community/pypi/wheels/simple/ \
+    --no-deps \
     --target="${ZOPEN_INSTALL_DIR}/lib/python" \
-    $(_snowflake_runtime_deps) \
+    $(_snowflake_bundle_deps) \
     || { printSoftError "Could not bundle the runtime dependencies"; return 1; }
 
   # Anything compiled would have been built for one interpreter and imported by
@@ -495,13 +539,17 @@ zopen_post_install() {
   # to import. Not every distribution name is its module name, so this lists
   # modules, not requirements.
   if [ -x "${_pi_py}" ]; then
-    if PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" "${_pi_py}" -c \
-        'import asn1crypto, OpenSSL, jwt, pytz, requests, packaging, charset_normalizer, idna, certifi, typing_extensions, filelock, sortedcontainers, platformdirs, tomlkit' 2> /dev/null; then
+    # pyOpenSSL is deliberately not in this list. It cannot import without
+    # cryptography, which is not in the bundle by design, so importing it here
+    # would test whether the cryptography port happens to be installed on the
+    # build machine rather than whether this bundle is sound. The check phase
+    # covers it, in a venv where cryptography is present.
+    _pi_mods='import asn1crypto, jwt, pytz, requests, packaging, charset_normalizer, idna, certifi, typing_extensions, filelock, sortedcontainers, platformdirs, tomlkit, boto3, botocore, urllib3, jmespath, s3transfer, dateutil, six'
+    if PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" "${_pi_py}" -c "${_pi_mods}" 2> /dev/null; then
       printInfo "- every bundled dependency imports from the bundle"
     else
       printSoftError "the bundled modules do not import from ${ZOPEN_INSTALL_DIR}/lib/python"
-      PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" "${_pi_py}" -c \
-        'import asn1crypto, OpenSSL, jwt, pytz, requests, packaging, charset_normalizer, idna, certifi, typing_extensions, filelock, sortedcontainers, platformdirs, tomlkit' 2>&1 \
+      PYTHONPATH="${ZOPEN_INSTALL_DIR}/lib/python" "${_pi_py}" -c "${_pi_mods}" 2>&1 \
         | while read -r _pi_line; do printSoftError "  ${_pi_line}"; done
       return 1
     fi
