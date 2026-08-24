@@ -37,25 +37,6 @@ src/c/_cffi_backend.c:15:10: fatal error: 'ffi.h' file not found
 The constraints file pins `cffi` to the version the index serves, which stops
 that.
 
-> **Note**
-> At the time of writing the published constraints file is wrong — it pins
-> three packages instead of the thirty-seven in the index, and `cffi` is not
-> among them. The cause is fixed in `meta`, but the served file stays wrong
-> until the next STABLE publish regenerates it. See
-> [Known issue](#known-issue-the-published-constraints-file).
->
-> Until then, `--only-binary=:all:` gets a **fresh** install through:
->
-> ```sh
-> export PIP_EXTRA_INDEX_URL="https://repo.zopen.community/pypi/wheels/simple/"
-> pip install --only-binary=:all: snowflake-connector-python
-> ```
->
-> It makes pip skip any version it cannot find a compatible wheel for, so it
-> falls back to the one the index has. It is a weaker tool than the constraints
-> file and not a general substitute: `--only-binary` has nothing to say about a
-> package that is *already installed*. Prefer the constraints file once it is
-> serving the right content.
 
 ## Using it
 
@@ -265,30 +246,23 @@ TypeError: deprecated() got an unexpected keyword argument 'name'
 which names neither package nor version. The port's checks assert the version
 directly so that this surfaces as what it is.
 
-## Known issue: the published constraints file
+## A note on the constraints file
 
-The zopen Python documentation tells you to use `PIP_CONSTRAINT` alongside the
-wheel index:
-
-```sh
-export PIP_EXTRA_INDEX_URL="https://repo.zopen.community/pypi/wheels/simple/"
-export PIP_CONSTRAINT="https://repo.zopen.community/pulp/content/constraints/zopen-constraints.txt"
-```
-
-At the time of writing that file pins only `bcrypt`, `jellyfish` and `psutil`,
-while the wheel index serves 37 packages. `cffi` and `cryptography` are both in
-the index and neither is pinned, which is why the `pip install` instructions
-above use `--only-binary=:all:` instead of relying on the constraints file.
-
-The cause was that the constraints file is generated from whichever wheel index
-the publish job ran against, but was published to a single fixed location shared
-by both build lines — so a `DEV` publish, whose index carries three packages,
-overwrote the `STABLE` one.
+The instructions above depend on the published constraints file pinning `cffi`
+to the version the index serves. That was briefly not true: the file was
+generated from whichever wheel index the publish job ran against but written to
+a single path shared by both build lines, so a `DEV` publish — whose index
+carries three packages — overwrote the `STABLE` one. Anyone following the
+documented instructions got `cffi` unpinned, pip took PyPI's newer release, and
+the install died on a missing `ffi.h` that had nothing to do with the package
+being installed.
 
 Fixed in `meta` (`c306a6ac`): STABLE keeps the documented path and any other
-index gets its own, so `wheels-dev` now publishes to `constraints-dev`. The
-served file stays wrong until the next STABLE publish regenerates it, which is
-why the install instructions above carry a workaround.
+index gets its own, so `wheels-dev` publishes to `constraints-dev`. The
+generated file now also names the index it came from. Verified after this
+port's first publish — the file carries 37 pins including `cffi==2.0.0` and
+`cryptography==50.0.0`, and a clean `pip install snowflake-connector-python`
+resolves both from the zopen index.
 
 ## Building
 
