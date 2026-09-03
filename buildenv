@@ -50,7 +50,7 @@
 ### compatible wheel for and fall back to the one the index carries. That is
 ### deliberately not a version pin: a pin goes stale the day the index moves.
 
-SNOWFLAKE_VERSION="4.7.2"
+SNOWFLAKE_VERSION="4.7.3"
 
 # bump: snowflake-version /SNOWFLAKE_VERSION="(.*)"/ https://github.com/snowflakedb/snowflake-connector-python.git|semver:*
 
